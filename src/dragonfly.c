@@ -1,0 +1,899 @@
+/*
+ * Simultaneous authentication of equals
+ * Copyright (c) 2012-2016, Jouni Malinen <j@w1.fi>
+ *
+ * This software may be distributed under the terms of the BSD license.
+ * See README for more details.
+ */
+
+#include "dragonfly.h"
+
+#include "sha256.h"
+#include "const_time.h"
+
+static void clear_temp_data(df_data *df)
+{
+    df_temporary_data *tmp;
+    if (df == NULL || df->tmp == NULL)
+    {
+        return;
+    }
+    tmp = df->tmp;
+    crypto_ec_deinit(tmp->ec);
+    crypto_bignum_deinit(tmp->prime_buf, 0);
+    crypto_bignum_deinit(tmp->order_buf, 0);
+    crypto_bignum_deinit(tmp->rand, 1);
+    crypto_bignum_deinit(tmp->pwe_ffc, 1);
+    crypto_bignum_deinit(tmp->own_commit_scalar, 0);
+    crypto_bignum_deinit(tmp->own_commit_element_ffc, 0);
+    crypto_bignum_deinit(tmp->peer_commit_element_ffc, 0);
+    crypto_ec_point_deinit(tmp->pwe_ecc, 1);
+    crypto_ec_point_deinit(tmp->own_commit_element_ecc, 0);
+    crypto_ec_point_deinit(tmp->peer_commit_element_ecc, 0);
+    df_buf_free(tmp->anti_clogging_token);
+    df_buf_free(tmp->own_rejected_groups);
+    df_buf_free(tmp->peer_rejected_groups);
+    os_free(tmp->pw_id);
+    bin_clear_free(tmp, sizeof(*tmp));
+    df->tmp = NULL;
+}
+
+static void clear_data(df_data *df)
+{
+    if (df == NULL)
+    {
+        return;
+    }
+    clear_temp_data(df);
+    crypto_bignum_deinit(df->peer_commit_scalar, 0);
+    crypto_bignum_deinit(df->peer_commit_scalar_accepted, 0);
+    os_memset(df, 0, sizeof(*df));
+}
+
+static int set_group(df_data *df, int group)
+{
+    clear_data(df);
+    df_temporary_data *tmp = df->tmp = os_zalloc(sizeof(*tmp));
+    if (tmp == NULL)
+    {
+        return -1;
+    }
+    tmp->ec = crypto_ec_init(group);
+    if (tmp->ec)
+    {
+        df->group = group;
+        tmp->prime_len = crypto_ec_prime_len(tmp->ec);
+        tmp->prime = crypto_ec_get_prime(tmp->ec);
+        tmp->order_len = crypto_ec_order_len(tmp->ec);
+        tmp->order = crypto_ec_get_order(tmp->ec);
+        return 0;
+    }
+    tmp->dh = dh_groups_get(group);
+    if (tmp->dh)
+    {
+        df->group = group;
+        tmp->prime_len = tmp->dh->prime_len;
+        if (tmp->prime_len > DF_MAX_PRIME_LEN)
+        {
+            clear_data(df);
+            return -1;
+        }
+        tmp->prime_buf = crypto_bignum_init_set(
+            tmp->dh->prime,
+            tmp->prime_len);
+        if (tmp->prime_buf == NULL)
+        {
+            clear_data(df);
+            return -1;
+        }
+        tmp->prime = tmp->prime_buf;
+        tmp->order_len = tmp->dh->order_len;
+        tmp->order_buf = crypto_bignum_init_set(
+            tmp->dh->order,
+            tmp->dh->order_len);
+        if (tmp->order_buf == NULL)
+        {
+            clear_data(df);
+            return -1;
+        }
+        tmp->order = tmp->order_buf;
+        return 0;
+    }
+    return -1;
+}
+
+int dragonfly_group_allowed(df_data *df, int *allowed_groups, u16 group)
+{
+    if (allowed_groups)
+    {
+        int i;
+        for (i = 0; allowed_groups[i] > 0; i++)
+        {
+            if (allowed_groups[i] == group)
+            {
+                break;
+            }
+        }
+        if (allowed_groups[i] != group)
+        {
+            return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
+        }
+    }
+    if (df->state == DF_COMMITTED && group != df->group)
+    {
+        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
+    }
+    if (group != df->group && set_group(df, group) < 0)
+    {
+        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
+    }
+    if (df->tmp == NULL)
+    {
+        return DF_ERR_FAIL;
+    }
+    if (df->tmp->dh && !allowed_groups)
+    {
+        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
+    }
+    return DF_OK;
+}
+
+static void pwd_seed_key(const u8 *addr1, const u8 *addr2, u8 *key)
+{
+    if (os_memcmp(addr1, addr2, ETH_ALEN) > 0)
+    {
+        os_memcpy(key, addr1, ETH_ALEN);
+        os_memcpy(key + ETH_ALEN, addr2, ETH_ALEN);
+    }
+    else
+    {
+        os_memcpy(key, addr2, ETH_ALEN);
+        os_memcpy(key + ETH_ALEN, addr1, ETH_ALEN);
+    }
+}
+
+static crypto_bignum *get_rand_1_to_p_1(const crypto_bignum *prime)
+{
+    crypto_bignum *tmp = crypto_bignum_init();
+    crypto_bignum *pm1 = crypto_bignum_init();
+    crypto_bignum *one = crypto_bignum_init_set((const u8 *)"\x01", 1);
+    if (
+        !tmp ||
+        !pm1 ||
+        !one ||
+        crypto_bignum_sub(prime, one, pm1) < 0 ||
+        crypto_bignum_rand(tmp, pm1) < 0 ||
+        crypto_bignum_add(tmp, one, tmp) < 0)
+    {
+        crypto_bignum_deinit(tmp, 0);
+        tmp = NULL;
+    }
+    crypto_bignum_deinit(pm1, 0);
+    crypto_bignum_deinit(one, 0);
+    return tmp;
+}
+
+static int is_quadratic_residue_blind(
+    crypto_ec *ec,
+    const u8 *qr, const u8 *qnr,
+    const crypto_bignum *val)
+{
+    int res = -1;
+    crypto_bignum *qr_or_qnr = NULL;
+    const crypto_bignum *prime = crypto_ec_get_prime(ec);
+    size_t prime_len = crypto_ec_prime_len(ec);
+    /*
+     * Use a blinding technique to mask val while determining whether it is
+     * a quadratic residue modulo p to avoid leaking timing information
+     * while determining the Legendre symbol.
+     *
+     * v = val
+     * r = a random number between 1 and p-1, inclusive
+     * num = (v * r * r) modulo p
+     */
+    crypto_bignum *r = get_rand_1_to_p_1(prime);
+    if (!r)
+    {
+        return -1;
+    }
+    crypto_bignum *num = crypto_bignum_init();
+    if (!num ||
+        crypto_bignum_mulmod(val, r, prime, num) < 0 ||
+        crypto_bignum_mulmod(num, r, prime, num) < 0)
+    {
+        goto fail;
+    }
+    /*
+     * Need to minimize differences in handling different cases, so try to
+     * avoid branches and timing differences.
+     *
+     * If r is odd:
+     * num = (num * qr) module p
+     * LGR(num, p) = 1 ==> quadratic residue
+     * else:
+     * num = (num * qnr) module p
+     * LGR(num, p) = -1 ==> quadratic residue
+     *
+     * mask is set to !odd(r)
+     */
+    u32 mask = const_time_is_zero((u32)crypto_bignum_is_odd(r));
+    u8 qr_or_qnr_bin[DF_MAX_ECC_PRIME_LEN];
+    const_time_select_bin((u8)mask, qnr, qr, prime_len, qr_or_qnr_bin);
+    qr_or_qnr = crypto_bignum_init_set(
+        qr_or_qnr_bin,
+        prime_len);
+    if (!qr_or_qnr ||
+        crypto_bignum_mulmod(num, qr_or_qnr, prime, num) < 0)
+    {
+        goto fail;
+    }
+    /* branchless version of check = odd(r) ? 1 : -1, */
+    int check = const_time_select_int(mask, -1, 1);
+    /* Determine the Legendre symbol on the masked value */
+    res = crypto_bignum_legendre(num, prime);
+    if (res == -2)
+    {
+        res = -1;
+        goto fail;
+    }
+    /* branchless version of res = res == check
+     * (res is -1, 0, or 1; check is -1 or 1) */
+    mask = const_time_eq((u32)res, (u32)check);
+    res = const_time_select_int(mask, 1, 0);
+fail:
+    crypto_bignum_deinit(num, 1);
+    crypto_bignum_deinit(r, 1);
+    crypto_bignum_deinit(qr_or_qnr, 1);
+    return res;
+}
+
+static int test_pwd_seed_ecc(
+    df_data *df,
+    const u8 *pwd_seed,
+    const u8 *prime,
+    const u8 *qr,
+    const u8 *qnr,
+    u8 *pwd_value)
+{
+    /* pwd-value = KDF-z(pwd-seed, "df Hunting and Pecking", p) */
+    size_t bits = crypto_ec_prime_len_bits(df->tmp->ec);
+    if (sha256_prf_bits(
+            pwd_seed,
+            SHA256_MAC_LEN,
+            "df Hunting and Pecking",
+            prime,
+            df->tmp->prime_len,
+            pwd_value,
+            bits) < 0)
+    {
+        return -1;
+    }
+    if (bits % 8)
+    {
+        buf_shift_right(pwd_value, df->tmp->prime_len, 8 - bits % 8);
+    }
+    int cmp_prime = const_time_memcmp(
+        pwd_value,
+        prime,
+        df->tmp->prime_len);
+    /* Create a const_time mask for selection based on prf result
+     * being smaller than prime. */
+    u32 in_range = const_time_fill_msb((u32)cmp_prime);
+    /* The algorithm description would skip the next steps if
+     * cmp_prime >= 0 (return 0 here), but go through them regardless to
+     * minimize externally observable differences in behavior. */
+    crypto_bignum *x_cand = crypto_bignum_init_set(
+        pwd_value,
+        df->tmp->prime_len);
+    if (!x_cand)
+    {
+        return -1;
+    }
+    crypto_bignum *y_sqr = crypto_ec_point_compute_y_sqr(df->tmp->ec, x_cand);
+    crypto_bignum_deinit(x_cand, 1);
+    if (!y_sqr)
+    {
+        return -1;
+    }
+    int res = is_quadratic_residue_blind(df->tmp->ec, qr, qnr, y_sqr);
+    crypto_bignum_deinit(y_sqr, 1);
+    if (res < 0)
+    {
+        return res;
+    }
+    return const_time_select_int(in_range, res, 0);
+}
+
+/* Returns -1 on fatal failure, 0 if PWE cannot be derived from the provided
+ * pwd-seed, or 1 if a valid PWE was derived from pwd-seed. */
+static int test_pwd_seed_ffc(
+    df_data *df,
+    const u8 *pwd_seed,
+    crypto_bignum *pwe)
+{
+    u8 pwd_value[DF_MAX_PRIME_LEN];
+    size_t bits = df->tmp->prime_len * 8;
+    /* pwd-value = KDF-z(pwd-seed, "df Hunting and Pecking", p) */
+    if (sha256_prf_bits(
+            pwd_seed,
+            SHA256_MAC_LEN,
+            "df Hunting and Pecking",
+            df->tmp->dh->prime,
+            df->tmp->prime_len,
+            pwd_value,
+            bits) < 0)
+    {
+        return -1;
+    }
+    /* Check whether pwd-value < p */
+    int res = const_time_memcmp(
+        pwd_value,
+        df->tmp->dh->prime,
+        df->tmp->prime_len);
+    /* pwd-value >= p is invalid, so res is < 0 for the valid cases and
+     * the negative sign can be used to fill the mask for constant time
+     * selection */
+    u8 pwd_value_valid = (u8)const_time_fill_msb((u32)res);
+    /* If pwd-value >= p, force pwd-value to be < p and perform the
+     * calculations anyway to hide timing difference. The derived PWE will
+     * be ignored in that case. */
+    pwd_value[0] = const_time_select_u8(pwd_value_valid, pwd_value[0], 0);
+    /* PWE = pwd-value^((p-1)/r) modulo p */
+    res = -1;
+    crypto_bignum *a = crypto_bignum_init_set(pwd_value, df->tmp->prime_len);
+    crypto_bignum *b = NULL;
+    if (!a)
+    {
+        goto fail;
+    }
+    u8 exp[1];
+    /* This is an optimization based on the used group that does not depend
+     * on the password in any way, so it is fine to use separate branches
+     * for this step without constant time operations. */
+    if (df->tmp->dh->safe_prime)
+    {
+        /*
+         * r = (p-1)/2 for the group used here, so this becomes:
+         * PWE = pwd-value^2 modulo p
+         */
+        exp[0] = 2;
+        b = crypto_bignum_init_set(exp, sizeof(exp));
+    }
+    else
+    {
+        /* Calculate exponent: (p-1)/r */
+        exp[0] = 1;
+        b = crypto_bignum_init_set(exp, sizeof(exp));
+        if (b == NULL ||
+            crypto_bignum_sub(df->tmp->prime, b, b) < 0 ||
+            crypto_bignum_div(b, df->tmp->order, b) < 0)
+            goto fail;
+    }
+    if (!b)
+    {
+        goto fail;
+    }
+    res = crypto_bignum_exptmod(a, b, df->tmp->prime, pwe);
+    if (res < 0)
+    {
+        goto fail;
+    }
+    /* There were no fatal errors in calculations, so determine the return
+     * value using constant time operations. We get here for number of
+     * invalid cases which are cleared here after having performed all the
+     * computation. PWE is valid if pwd-value was less than prime and
+     * PWE > 1. Start with pwd-value check first and then use constant time
+     * operations to clear res to 0 if PWE is 0 or 1.
+     */
+    res = const_time_select_u8(pwd_value_valid, 1, 0);
+    int is_val = crypto_bignum_is_zero(pwe);
+    res = const_time_select_u8((u8)const_time_is_zero((u32)is_val), (u8)res, 0);
+    is_val = crypto_bignum_is_one(pwe);
+    res = const_time_select_u8((u8)const_time_is_zero((u32)is_val), (u8)res, 0);
+fail:
+    crypto_bignum_deinit(a, 1);
+    crypto_bignum_deinit(b, 1);
+    return res;
+}
+
+static int get_random_qr_qnr(
+    const crypto_bignum *prime,
+    crypto_bignum **qr,
+    crypto_bignum **qnr)
+{
+    *qr = *qnr = NULL;
+    while (!(*qr) || !(*qnr))
+    {
+        crypto_bignum *tmp = crypto_bignum_init();
+        if (!tmp || crypto_bignum_rand(tmp, prime) < 0)
+        {
+            crypto_bignum_deinit(tmp, 0);
+            break;
+        }
+        int res = crypto_bignum_legendre(tmp, prime);
+        if (res == 1 && !(*qr))
+        {
+            *qr = tmp;
+        }
+        else if (res == -1 && !(*qnr))
+        {
+            *qnr = tmp;
+        }
+        else
+        {
+            crypto_bignum_deinit(tmp, 0);
+            if (res == -2)
+            {
+                break;
+            }
+        }
+    }
+    if (*qr && *qnr)
+    {
+        return 0;
+    }
+    crypto_bignum_deinit(*qr, 0);
+    crypto_bignum_deinit(*qnr, 0);
+    *qr = *qnr = NULL;
+    return -1;
+}
+
+static u8 min_pwe_loop_iter(int group)
+{
+    if (group == 22 || group == 23 || group == 24)
+    {
+        /* FFC groups for which pwd-value is likely to be >= p
+         * frequently */
+        return 40;
+    }
+    if (group == 1 || group == 2 || group == 5 || group == 14 ||
+        group == 15 || group == 16 || group == 17 || group == 18)
+    {
+        /* FFC groups that have prime that is close to a power of two */
+        return 1;
+    }
+    /* Default to 40 (this covers most ECC groups) */
+    return 40;
+}
+
+/* res = sqrt(val) */
+static int bignum_sqrt(crypto_ec *ec, const crypto_bignum *val, crypto_bignum *res)
+{
+    int ret = 0;
+    /* For prime p such that p = 3 mod 4, sqrt(w) = w^((p+1)/4) mod p */
+    const crypto_bignum *prime = crypto_ec_get_prime(ec);
+    size_t prime_len = crypto_ec_prime_len(ec);
+    crypto_bignum *tmp = crypto_bignum_init();
+    crypto_bignum *one = crypto_bignum_init_uint(1);
+    u8 prime_bin[DF_MAX_ECC_PRIME_LEN];
+    if (
+        crypto_bignum_to_bin(
+            prime,
+            prime_bin,
+            sizeof(prime_bin),
+            prime_len) < 0 ||
+        (prime_bin[prime_len - 1] & 0x03) != 3 ||
+        !tmp ||
+        !one ||
+        /* tmp = (p+1)/4 */
+        crypto_bignum_add(prime, one, tmp) < 0 ||
+        crypto_bignum_rshift(tmp, 2, tmp) < 0 ||
+        /* res = sqrt(val) */
+        crypto_bignum_exptmod(val, tmp, prime, res) < 0)
+    {
+        ret = -1;
+    }
+    crypto_bignum_deinit(tmp, 0);
+    crypto_bignum_deinit(one, 0);
+    return ret;
+}
+
+static int derive_pwe_ecc(
+    df_data *df,
+    const u8 *addr1,
+    const u8 *addr2,
+    const u8 *password,
+    size_t password_len)
+{
+    crypto_bignum *x = NULL, *y = NULL, *qr = NULL, *qnr = NULL;
+    u8 x_bin[DF_MAX_ECC_PRIME_LEN];
+    u8 x_cand_bin[DF_MAX_ECC_PRIME_LEN];
+    u8 qr_bin[DF_MAX_ECC_PRIME_LEN];
+    u8 qnr_bin[DF_MAX_ECC_PRIME_LEN];
+    u8 x_y[2 * DF_MAX_ECC_PRIME_LEN];
+    os_memset(x_bin, 0, sizeof(x_bin));
+    int res = -1;
+    u8 *stub_password = os_malloc(password_len);
+    u8 *tmp_password = os_malloc(password_len);
+    if (!stub_password ||
+        !tmp_password ||
+        crypto_rand_bytes(stub_password, password_len) < 0)
+    {
+        goto fail;
+    }
+    u8 prime[DF_MAX_ECC_PRIME_LEN];
+    size_t prime_len = df->tmp->prime_len;
+    if (crypto_bignum_to_bin(
+            df->tmp->prime,
+            prime,
+            sizeof(prime),
+            prime_len) < 0)
+    {
+        goto fail;
+    }
+    /*
+     * Create a random quadratic residue (qr) and quadratic non-residue
+     * (qnr) modulo p for blinding purposes during the loop.
+     */
+    if (get_random_qr_qnr(df->tmp->prime, &qr, &qnr) < 0 ||
+        crypto_bignum_to_bin(qr, qr_bin, sizeof(qr_bin), prime_len) < 0 ||
+        crypto_bignum_to_bin(qnr, qnr_bin, sizeof(qnr_bin), prime_len) < 0)
+    {
+        goto fail;
+    }
+    u8 counter;
+    u8 addrs[2 * ETH_ALEN];
+    const u8 *addr[2];
+    size_t len[2];
+    /*
+     * H(salt, ikm) = HMAC-SHA256(salt, ikm)
+     * base = password
+     * pwd-seed = H(MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC),
+     *              base || counter)
+     */
+    pwd_seed_key(addr1, addr2, addrs);
+    addr[0] = tmp_password;
+    len[0] = password_len;
+    addr[1] = &counter;
+    len[1] = sizeof(counter);
+    /*
+     * Continue for at least k iterations to protect against side-channel
+     * attacks that attempt to determine the number of iterations required
+     * in the loop.
+     */
+    u8 k = min_pwe_loop_iter(df->group);
+    /* 0 (false) or 0xff (true) to be used as const_time_* mask */
+    u8 found = 0;
+    u8 pwd_seed_odd = 0;
+    for (counter = 1; counter <= k || !found; counter++)
+    {
+        u8 pwd_seed[SHA256_MAC_LEN];
+        if (counter > 200)
+        {
+            /* This should not happen in practice */
+            break;
+        }
+        const_time_select_bin(
+            found,
+            stub_password,
+            password,
+            password_len,
+            tmp_password);
+        if (hmac_sha256_vector(
+                addrs,
+                sizeof(addrs), 2,
+                addr,
+                len,
+                pwd_seed) < 0)
+        {
+            break;
+        }
+        res = test_pwd_seed_ecc(
+            df,
+            pwd_seed,
+            prime,
+            qr_bin,
+            qnr_bin,
+            x_cand_bin);
+        const_time_select_bin(
+            found,
+            x_bin,
+            x_cand_bin,
+            prime_len,
+            x_bin);
+        pwd_seed_odd = const_time_select_u8(
+            found,
+            pwd_seed_odd,
+            pwd_seed[SHA256_MAC_LEN - 1] & 0x01);
+        os_memset(pwd_seed, 0, sizeof(pwd_seed));
+        if (res < 0)
+        {
+            goto fail;
+        }
+        /* Need to minimize differences in handling res == 0 and 1 here
+         * to avoid differences in timing and instruction cache access,
+         * so use const_time_select_*() to make local copies of the
+         * values based on whether this loop iteration was the one that
+         * found the pwd-seed/x. */
+        /* found is 0 or 0xff here and res is 0 or 1. Bitwise OR of them
+         * (with res converted to 0/0xff) handles this in constant time.
+         */
+        found |= (u8)res * 0xff;
+    }
+    if (!found)
+    {
+        res = -1;
+        goto fail;
+    }
+    x = crypto_bignum_init_set(x_bin, prime_len);
+    if (!x)
+    {
+        res = -1;
+        goto fail;
+    }
+    /* y = sqrt(x^3 + ax + b) mod p
+     * if LSB(save) == LSB(y): PWE = (x, y)
+     * else: PWE = (x, p - y)
+     *
+     * Calculate y and the two possible values for PWE and after that,
+     * use constant time selection to copy the correct alternative.
+     */
+    y = crypto_ec_point_compute_y_sqr(df->tmp->ec, x);
+    if (!y ||
+        bignum_sqrt(df->tmp->ec, y, y) < 0 ||
+        crypto_bignum_to_bin(y, x_y, DF_MAX_ECC_PRIME_LEN, prime_len) < 0 ||
+        crypto_bignum_sub(df->tmp->prime, y, y) < 0 ||
+        crypto_bignum_to_bin(
+            y,
+            x_y + DF_MAX_ECC_PRIME_LEN,
+            DF_MAX_ECC_PRIME_LEN,
+            prime_len) < 0)
+    {
+        goto fail;
+    }
+    u32 is_eq = const_time_eq(pwd_seed_odd, x_y[prime_len - 1] & 0x01);
+    const_time_select_bin(
+        (u8)is_eq,
+        x_y,
+        x_y + DF_MAX_ECC_PRIME_LEN,
+        prime_len,
+        x_y + prime_len);
+    os_memcpy(x_y, x_bin, prime_len);
+    crypto_ec_point_deinit(df->tmp->pwe_ecc, 1);
+    df->tmp->pwe_ecc = crypto_ec_point_from_bin(df->tmp->ec, x_y);
+    if (!df->tmp->pwe_ecc)
+    {
+        res = -1;
+    }
+fail:
+    forced_memzero(x_y, sizeof(x_y));
+    crypto_bignum_deinit(qr, 0);
+    crypto_bignum_deinit(qnr, 0);
+    crypto_bignum_deinit(y, 1);
+    os_free(stub_password);
+    bin_clear_free(tmp_password, password_len);
+    crypto_bignum_deinit(x, 1);
+    os_memset(x_bin, 0, sizeof(x_bin));
+    os_memset(x_cand_bin, 0, sizeof(x_cand_bin));
+    return res;
+}
+
+static int derive_pwe_ffc(
+    df_data *df,
+    const u8 *addr1,
+    const u8 *addr2,
+    const u8 *password,
+    size_t password_len)
+{
+    crypto_bignum_deinit(df->tmp->pwe_ffc, 1);
+    df->tmp->pwe_ffc = NULL;
+    size_t prime_len = df->tmp->prime_len;
+    /* Allocate a buffer to maintain selected and candidate PWE for constant
+     * time selection. */
+    u8 *pwe_buf = os_zalloc(prime_len * 2);
+    crypto_bignum *pwe = crypto_bignum_init();
+    if (!pwe_buf || !pwe)
+    {
+        goto fail;
+    }
+    u8 counter;
+    u8 addrs[2 * ETH_ALEN];
+    const u8 *addr[2];
+    size_t len[2];
+    /*
+     * H(salt, ikm) = HMAC-SHA256(salt, ikm)
+     * pwd-seed = H(MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC),
+     *              password || counter)
+     */
+    pwd_seed_key(addr1, addr2, addrs);
+    addr[0] = password;
+    len[0] = password_len;
+    addr[1] = &counter;
+    len[1] = sizeof(counter);
+    u8 k = min_pwe_loop_iter(df->group);
+    /* 0 (false) or 0xff (true) to be used as const_time_* mask */
+    u8 found = 0;
+    u8 sel_counter = 0;
+    for (counter = 1; counter <= k || !found; counter++)
+    {
+        u8 pwd_seed[SHA256_MAC_LEN];
+        if (counter > 200)
+        {
+            /* This should not happen in practice */
+            break;
+        }
+        if (hmac_sha256_vector(
+                addrs,
+                sizeof(addrs), 2,
+                addr,
+                len,
+                pwd_seed) < 0)
+        {
+            break;
+        }
+        int res = test_pwd_seed_ffc(df, pwd_seed, pwe);
+        /* res is -1 for fatal failure, 0 if a valid PWE was not found,
+         * or 1 if a valid PWE was found. */
+        if (res < 0)
+        {
+            break;
+        }
+        /* Store the candidate PWE into the second half of pwe_buf and
+         * the selected PWE in the beginning of pwe_buf using constant
+         * time selection. */
+        if (crypto_bignum_to_bin(
+                pwe,
+                pwe_buf + prime_len,
+                prime_len,
+                prime_len) < 0)
+        {
+            break;
+        }
+        const_time_select_bin(
+            found,
+            pwe_buf,
+            pwe_buf + prime_len,
+            prime_len,
+            pwe_buf);
+        sel_counter = const_time_select_u8(found, sel_counter, counter);
+        u8 mask = const_time_eq_u8((u32)res, 1);
+        found = const_time_select_u8(found, found, mask);
+    }
+    if (!found)
+    {
+        goto fail;
+    }
+    df->tmp->pwe_ffc = crypto_bignum_init_set(pwe_buf, prime_len);
+fail:
+    crypto_bignum_deinit(pwe, 1);
+    bin_clear_free(pwe_buf, prime_len * 2);
+    return df->tmp->pwe_ffc ? 0 : -1;
+}
+
+static int derive_commit_element_ecc(df_data *df, crypto_bignum *mask)
+{
+    /* COMMIT-ELEMENT = inverse(scalar-op(mask, PWE)) */
+    if (!df->tmp->own_commit_element_ecc)
+    {
+        df->tmp->own_commit_element_ecc = crypto_ec_point_init(df->tmp->ec);
+        if (!df->tmp->own_commit_element_ecc)
+        {
+            return -1;
+        }
+    }
+    if (crypto_ec_point_mul(
+            df->tmp->ec,
+            df->tmp->pwe_ecc,
+            mask,
+            df->tmp->own_commit_element_ecc) < 0 ||
+        crypto_ec_point_invert(
+            df->tmp->ec,
+            df->tmp->own_commit_element_ecc) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int derive_commit_element_ffc(df_data *df, crypto_bignum *mask)
+{
+    /* COMMIT-ELEMENT = inverse(scalar-op(mask, PWE)) */
+    if (!df->tmp->own_commit_element_ffc)
+    {
+        df->tmp->own_commit_element_ffc = crypto_bignum_init();
+        if (!df->tmp->own_commit_element_ffc)
+        {
+            return -1;
+        }
+    }
+    if (crypto_bignum_exptmod(
+            df->tmp->pwe_ffc,
+            mask,
+            df->tmp->prime,
+            df->tmp->own_commit_element_ffc) < 0 ||
+        crypto_bignum_inverse(
+            df->tmp->own_commit_element_ffc,
+            df->tmp->prime,
+            df->tmp->own_commit_element_ffc) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int get_rand_2_to_r_1(
+    crypto_bignum *val,
+    const crypto_bignum *order)
+{
+    return crypto_bignum_rand(val, order) == 0 &&
+           !crypto_bignum_is_zero(val) &&
+           !crypto_bignum_is_one(val);
+}
+
+static int generate_scalar(
+    const crypto_bignum *order,
+    crypto_bignum *_rand,
+    crypto_bignum *_mask,
+    crypto_bignum *scalar)
+{
+    /* Select two random values rand,mask such that 1 < rand,mask < r and
+     * rand + mask mod r > 1. */
+    for (int count = 0; count < 100; count++)
+    {
+        if (get_rand_2_to_r_1(_rand, order) &&
+            get_rand_2_to_r_1(_mask, order) &&
+            crypto_bignum_add(_rand, _mask, scalar) == 0 &&
+            crypto_bignum_mod(scalar, order, scalar) == 0 &&
+            !crypto_bignum_is_zero(scalar) &&
+            !crypto_bignum_is_one(scalar))
+        {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int derive_commit(df_data *df)
+{
+    crypto_bignum *mask = crypto_bignum_init();
+    if (!df->tmp->rand)
+    {
+        df->tmp->rand = crypto_bignum_init();
+    }
+    if (!df->tmp->own_commit_scalar)
+    {
+        df->tmp->own_commit_scalar = crypto_bignum_init();
+    }
+    int ret = !mask ||
+              !df->tmp->rand ||
+              !df->tmp->own_commit_scalar ||
+              generate_scalar(
+                  df->tmp->order,
+                  df->tmp->rand,
+                  mask,
+                  df->tmp->own_commit_scalar) < 0 ||
+              (df->tmp->ec &&
+               derive_commit_element_ecc(df, mask) < 0) ||
+              (df->tmp->dh &&
+               derive_commit_element_ffc(df, mask) < 0);
+    crypto_bignum_deinit(mask, 1);
+    return ret ? -1 : 0;
+}
+
+int dragonfly_prepare_commit(
+    const u8 *addr1,
+    const u8 *addr2,
+    const u8 *password,
+    size_t password_len,
+    df_data *df)
+{
+    if (df->tmp == NULL ||
+        (df->tmp->ec && derive_pwe_ecc(
+                            df,
+                            addr1,
+                            addr2,
+                            password,
+                            password_len) < 0) ||
+        (df->tmp->dh && derive_pwe_ffc(
+                            df,
+                            addr1,
+                            addr2,
+                            password,
+                            password_len) < 0))
+    {
+        return -1;
+    }
+    df->h2e = 0;
+    df->pk = 0;
+    return derive_commit(df);
+}
