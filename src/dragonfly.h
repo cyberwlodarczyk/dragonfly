@@ -97,4 +97,6 @@ int dragonfly_prepare_commit(
     size_t password_len,
     df_data *df);
 
+int dragonfly_process_commit(df_data *df);
+
 #endif

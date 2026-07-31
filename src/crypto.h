@@ -132,11 +132,25 @@ const crypto_bignum *crypto_ec_get_order(crypto_ec *e);
 
 size_t crypto_ec_order_len(crypto_ec *e);
 
+int crypto_ec_point_add(
+    crypto_ec *e,
+    const crypto_ec_point *a,
+    const crypto_ec_point *b,
+    crypto_ec_point *c);
+
 crypto_bignum *crypto_ec_point_compute_y_sqr(
     crypto_ec *e,
     const crypto_bignum *x);
 
+int crypto_ec_point_is_at_infinity(crypto_ec *e, const crypto_ec_point *p);
+
 crypto_ec_point *crypto_ec_point_from_bin(crypto_ec *e, const u8 *val);
+
+int crypto_ec_point_to_bin(
+    crypto_ec *e,
+    const crypto_ec_point *point,
+    u8 *x,
+    u8 *y);
 
 void crypto_ec_deinit(crypto_ec *e);
 

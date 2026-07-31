@@ -425,6 +425,15 @@ size_t crypto_ec_order_len(crypto_ec *e)
     return (size_t)BN_num_bytes(e->order);
 }
 
+int crypto_ec_point_add(
+    crypto_ec *e,
+    const crypto_ec_point *a,
+    const crypto_ec_point *b,
+    crypto_ec_point *c)
+{
+    return EC_POINT_add(e->group, c, a, b, e->bnctx) ? 0 : -1;
+}
+
 crypto_bignum *crypto_ec_point_compute_y_sqr(
     crypto_ec *e,
     const crypto_bignum *x)
@@ -432,15 +441,20 @@ crypto_bignum *crypto_ec_point_compute_y_sqr(
     BIGNUM *tmp = BN_new();
     /* y^2 = x^3 + ax + b = (x^2 + a)x + b */
     if (tmp &&
-        BN_mod_sqr(tmp, (const BIGNUM *)x, e->prime, e->bnctx) &&
+        BN_mod_sqr(tmp, x, e->prime, e->bnctx) &&
         BN_mod_add_quick(tmp, e->a, tmp, e->prime) &&
-        BN_mod_mul(tmp, tmp, (const BIGNUM *)x, e->prime, e->bnctx) &&
+        BN_mod_mul(tmp, tmp, x, e->prime, e->bnctx) &&
         BN_mod_add_quick(tmp, tmp, e->b, e->prime))
     {
         return tmp;
     }
     BN_clear_free(tmp);
     return NULL;
+}
+
+int crypto_ec_point_is_at_infinity(crypto_ec *e, const crypto_ec_point *p)
+{
+    return EC_POINT_is_at_infinity(e->group, p);
 }
 
 crypto_ec_point *crypto_ec_point_from_bin(crypto_ec *e, const u8 *val)
@@ -464,6 +478,43 @@ crypto_ec_point *crypto_ec_point_from_bin(crypto_ec *e, const u8 *val)
     BN_clear_free(x);
     BN_clear_free(y);
     return elem;
+}
+
+int crypto_ec_point_to_bin(
+    crypto_ec *e,
+    const crypto_ec_point *point,
+    u8 *x,
+    u8 *y)
+{
+    int ret = -1;
+    BIGNUM *x_bn = BN_new();
+    BIGNUM *y_bn = BN_new();
+    if (x_bn &&
+        y_bn &&
+        EC_POINT_get_affine_coordinates(
+            e->group,
+            point,
+            x_bn,
+            y_bn,
+            e->bnctx))
+    {
+        size_t len = (size_t)BN_num_bytes(e->prime);
+        if (x)
+        {
+            ret = crypto_bignum_to_bin(x_bn, x, len, len);
+        }
+        if (ret >= 0 && y)
+        {
+            ret = crypto_bignum_to_bin(y_bn, y, len, len);
+        }
+        if (ret > 0)
+        {
+            ret = 0;
+        }
+    }
+    BN_clear_free(x_bn);
+    BN_clear_free(y_bn);
+    return ret;
 }
 
 void crypto_ec_deinit(crypto_ec *e)

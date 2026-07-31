@@ -897,3 +897,319 @@ int dragonfly_prepare_commit(
     df->pk = 0;
     return derive_commit(df);
 }
+
+static int derive_k_ecc(df_data *df, u8 *k)
+{
+    int ret = -1;
+    crypto_ec_point *K = crypto_ec_point_init(df->tmp->ec);
+    if (K == NULL)
+    {
+        goto fail;
+    }
+    /*
+     * K = scalar-op(rand, (elem-op(scalar-op(peer-commit-scalar, PWE),
+     *                                        PEER-COMMIT-ELEMENT)))
+     * If K is identity element (point-at-infinity), reject
+     * k = F(K) (= x coordinate)
+     */
+    if (crypto_ec_point_mul(
+            df->tmp->ec,
+            df->tmp->pwe_ecc,
+            df->peer_commit_scalar,
+            K) < 0 ||
+        crypto_ec_point_add(
+            df->tmp->ec,
+            K,
+            df->tmp->peer_commit_element_ecc,
+            K) < 0 ||
+        crypto_ec_point_mul(df->tmp->ec, K, df->tmp->rand, K) < 0 ||
+        crypto_ec_point_is_at_infinity(df->tmp->ec, K) ||
+        crypto_ec_point_to_bin(df->tmp->ec, K, k, NULL) < 0)
+    {
+        goto fail;
+    }
+    ret = 0;
+fail:
+    crypto_ec_point_deinit(K, 1);
+    return ret;
+}
+
+static int derive_k_ffc(df_data *df, u8 *k)
+{
+    int ret = -1;
+    crypto_bignum *K = crypto_bignum_init();
+    if (K == NULL)
+    {
+        goto fail;
+    }
+    /*
+     * K = scalar-op(rand, (elem-op(scalar-op(peer-commit-scalar, PWE),
+     *                                        PEER-COMMIT-ELEMENT)))
+     * If K is identity element (one), reject.
+     * k = F(K) (= x coordinate)
+     */
+    if (crypto_bignum_exptmod(
+            df->tmp->pwe_ffc,
+            df->peer_commit_scalar,
+            df->tmp->prime,
+            K) < 0 ||
+        crypto_bignum_mulmod(
+            K,
+            df->tmp->peer_commit_element_ffc,
+            df->tmp->prime,
+            K) < 0 ||
+        crypto_bignum_exptmod(K, df->tmp->rand, df->tmp->prime, K) < 0 ||
+        crypto_bignum_is_one(K) ||
+        crypto_bignum_to_bin(K, k, DF_MAX_PRIME_LEN, df->tmp->prime_len) < 0)
+    {
+        goto fail;
+    }
+    ret = 0;
+fail:
+    crypto_bignum_deinit(K, 1);
+    return ret;
+}
+
+static size_t ffc_prime_len_2_hash_len(size_t prime_len)
+{
+    if (prime_len <= 2048 / 8)
+    {
+        return 32;
+    }
+    if (prime_len <= 3072 / 8)
+    {
+        return 48;
+    }
+    return 64;
+}
+
+static size_t ecc_prime_len_2_hash_len(size_t prime_len)
+{
+    if (prime_len <= 256 / 8)
+    {
+        return 32;
+    }
+    if (prime_len <= 384 / 8)
+    {
+        return 48;
+    }
+    return 64;
+}
+
+#define WPA_KEY_MGMT_SAE_EXT_KEY BIT(26)
+#define WPA_KEY_MGMT_FT_SAE_EXT_KEY BIT(27)
+
+static inline int wpa_key_mgmt_sae_ext_key(int akm)
+{
+    return !!(akm & (int)(WPA_KEY_MGMT_SAE_EXT_KEY | WPA_KEY_MGMT_FT_SAE_EXT_KEY));
+}
+
+static int hkdf_extract(
+    size_t hash_len,
+    const u8 *salt,
+    size_t salt_len,
+    size_t num_elem,
+    const u8 *addr[],
+    const size_t len[],
+    u8 *prk)
+{
+    if (hash_len == 32)
+    {
+        return hmac_sha256_vector(
+            salt,
+            salt_len,
+            num_elem,
+            addr,
+            len,
+            prk);
+    }
+    return -1;
+}
+
+static int kdf_hash(
+    size_t hash_len,
+    const u8 *k,
+    const char *label,
+    const u8 *context,
+    size_t context_len,
+    u8 *out,
+    size_t out_len)
+{
+    if (hash_len == 32)
+    {
+        return sha256_prf(
+            k,
+            hash_len,
+            label,
+            context,
+            context_len,
+            out,
+            out_len);
+    }
+    return -1;
+}
+
+static int derive_keys(df_data *df, const u8 *k)
+{
+    int ret = -1;
+    df_buf *rejected_groups = NULL;
+    crypto_bignum *tmp = crypto_bignum_init();
+    if (tmp == NULL)
+    {
+        goto fail;
+    }
+    size_t hash_len, prime_len = df->tmp->prime_len;
+    /* keyseed = H(salt, k)
+     * KCK || PMK = KDF-Hash-Length(keyseed, "SAE KCK and PMK",
+     *                      (commit-scalar + peer-commit-scalar) modulo r)
+     * PMKID = L((commit-scalar + peer-commit-scalar) modulo r, 0, 128)
+     *
+     * When SAE-PK is used,
+     * KCK || PMK || KEK = KDF-Hash-Length(keyseed, "SAE-PK keys", context)
+     */
+    if (!df->h2e)
+    {
+        hash_len = SHA256_MAC_LEN;
+    }
+    else if (df->tmp->dh)
+    {
+        hash_len = ffc_prime_len_2_hash_len(prime_len);
+    }
+    else
+    {
+        hash_len = ecc_prime_len_2_hash_len(prime_len);
+    }
+    size_t pmk_len;
+    if (wpa_key_mgmt_sae_ext_key(df->akmp))
+    {
+        pmk_len = hash_len;
+    }
+    else
+    {
+        pmk_len = DF_PMK_LEN;
+    }
+    const u8 *salt;
+    size_t salt_len;
+    u8 zero[DF_MAX_HASH_LEN];
+    if (df->h2e &&
+        (df->tmp->own_rejected_groups || df->tmp->peer_rejected_groups))
+    {
+        df_buf *own, *peer;
+        own = df->tmp->own_rejected_groups;
+        peer = df->tmp->peer_rejected_groups;
+        salt_len = 0;
+        if (own)
+        {
+            salt_len += df_buf_len(own);
+        }
+        if (peer)
+        {
+            salt_len += df_buf_len(peer);
+        }
+        rejected_groups = df_buf_alloc(salt_len);
+        if (!rejected_groups)
+        {
+            goto fail;
+        }
+        if (df->tmp->own_addr_higher)
+        {
+            if (own)
+            {
+                df_buf_put_buf(rejected_groups, own);
+            }
+            if (peer)
+            {
+                df_buf_put_buf(rejected_groups, peer);
+            }
+        }
+        else
+        {
+            if (peer)
+            {
+                df_buf_put_buf(rejected_groups, peer);
+            }
+            if (own)
+            {
+                df_buf_put_buf(rejected_groups, own);
+            }
+        }
+        salt = df_buf_head(rejected_groups);
+        salt_len = df_buf_len(rejected_groups);
+    }
+    else
+    {
+        os_memset(zero, 0, hash_len);
+        salt = zero;
+        salt_len = hash_len;
+    }
+    const u8 *addr[1] = {k};
+    size_t len[1] = {prime_len};
+    u8 keyseed[DF_MAX_HASH_LEN];
+    if (hkdf_extract(hash_len, salt, salt_len, 1, addr, len, keyseed) < 0)
+    {
+        goto fail;
+    }
+    if (crypto_bignum_add(
+            df->tmp->own_commit_scalar,
+            df->peer_commit_scalar,
+            tmp) < 0 ||
+        crypto_bignum_mod(
+            tmp,
+            df->tmp->order,
+            tmp) < 0)
+    {
+        goto fail;
+    }
+    u8 val[DF_MAX_PRIME_LEN];
+    /* IEEE Std 802.11-2016 is not exactly clear on the encoding of the bit
+     * string that is needed for KCK, PMK, and PMKID derivation, but it
+     * seems to make most sense to encode the
+     * (commit-scalar + peer-commit-scalar) mod r part as a bit string by
+     * zero padding it from left to the length of the order (in full
+     * octets). */
+    if (crypto_bignum_to_bin(
+            tmp,
+            val,
+            sizeof(val),
+            df->tmp->order_len) < 0)
+    {
+        goto fail;
+    }
+    u8 keys[2 * DF_MAX_HASH_LEN + DF_PMK_LEN_MAX];
+    if (kdf_hash(
+            hash_len,
+            keyseed,
+            "SAE KCK and PMK",
+            val,
+            df->tmp->order_len,
+            keys,
+            hash_len + pmk_len) < 0)
+    {
+        goto fail;
+    }
+    forced_memzero(keyseed, sizeof(keyseed));
+    os_memcpy(df->tmp->kck, keys, hash_len);
+    df->tmp->kck_len = hash_len;
+    os_memcpy(df->pmk, keys + hash_len, pmk_len);
+    df->pmk_len = pmk_len;
+    os_memcpy(df->pmkid, val, DF_PMKID_LEN);
+    forced_memzero(keys, sizeof(keys));
+    ret = 0;
+fail:
+    df_buf_free(rejected_groups);
+    crypto_bignum_deinit(tmp, 0);
+    return ret;
+}
+
+int dragonfly_process_commit(df_data *df)
+{
+    u8 k[DF_MAX_PRIME_LEN];
+    if (df->tmp == NULL ||
+        (df->tmp->ec && derive_k_ecc(df, k) < 0) ||
+        (df->tmp->dh && derive_k_ffc(df, k) < 0) ||
+        derive_keys(df, k) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
