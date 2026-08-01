@@ -138,17 +138,21 @@ int dragonfly_group_allowed(df_data *df, int *allowed_groups, u16 group)
     return DF_OK;
 }
 
-static void pwd_seed_key(const u8 *addr1, const u8 *addr2, u8 *key)
+static void pwd_seed_key(
+    const u8 *aid,
+    const u8 *bid,
+    size_t id_len,
+    u8 *key)
 {
-    if (os_memcmp(addr1, addr2, ETH_ALEN) > 0)
+    if (os_memcmp(aid, bid, id_len) > 0)
     {
-        os_memcpy(key, addr1, ETH_ALEN);
-        os_memcpy(key + ETH_ALEN, addr2, ETH_ALEN);
+        os_memcpy(key, aid, id_len);
+        os_memcpy(key + id_len, bid, id_len);
     }
     else
     {
-        os_memcpy(key, addr2, ETH_ALEN);
-        os_memcpy(key + ETH_ALEN, addr1, ETH_ALEN);
+        os_memcpy(key, bid, id_len);
+        os_memcpy(key + id_len, aid, id_len);
     }
 }
 
@@ -490,11 +494,13 @@ static int bignum_sqrt(crypto_ec *ec, const crypto_bignum *val, crypto_bignum *r
 
 static int derive_pwe_ecc(
     df_data *df,
-    const u8 *addr1,
-    const u8 *addr2,
+    const u8 *aid,
+    const u8 *bid,
+    const size_t id_len,
     const u8 *password,
     size_t password_len)
 {
+    u8 ids[2 * id_len];
     crypto_bignum *x = NULL, *y = NULL, *qr = NULL, *qnr = NULL;
     u8 x_bin[DF_MAX_ECC_PRIME_LEN];
     u8 x_cand_bin[DF_MAX_ECC_PRIME_LEN];
@@ -532,7 +538,6 @@ static int derive_pwe_ecc(
         goto fail;
     }
     u8 counter;
-    u8 addrs[2 * ETH_ALEN];
     const u8 *addr[2];
     size_t len[2];
     /*
@@ -541,7 +546,7 @@ static int derive_pwe_ecc(
      * pwd-seed = H(MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC),
      *              base || counter)
      */
-    pwd_seed_key(addr1, addr2, addrs);
+    pwd_seed_key(aid, bid, id_len, ids);
     addr[0] = tmp_password;
     len[0] = password_len;
     addr[1] = &counter;
@@ -570,8 +575,8 @@ static int derive_pwe_ecc(
             password_len,
             tmp_password);
         if (hmac_sha256_vector(
-                addrs,
-                sizeof(addrs), 2,
+                ids,
+                sizeof(ids), 2,
                 addr,
                 len,
                 pwd_seed) < 0)
@@ -670,11 +675,13 @@ fail:
 
 static int derive_pwe_ffc(
     df_data *df,
-    const u8 *addr1,
-    const u8 *addr2,
+    const u8 *aid,
+    const u8 *bid,
+    const size_t id_len,
     const u8 *password,
     size_t password_len)
 {
+    u8 ids[2 * id_len];
     crypto_bignum_deinit(df->tmp->pwe_ffc, 1);
     df->tmp->pwe_ffc = NULL;
     size_t prime_len = df->tmp->prime_len;
@@ -687,7 +694,6 @@ static int derive_pwe_ffc(
         goto fail;
     }
     u8 counter;
-    u8 addrs[2 * ETH_ALEN];
     const u8 *addr[2];
     size_t len[2];
     /*
@@ -695,7 +701,7 @@ static int derive_pwe_ffc(
      * pwd-seed = H(MAX(STA-A-MAC, STA-B-MAC) || MIN(STA-A-MAC, STA-B-MAC),
      *              password || counter)
      */
-    pwd_seed_key(addr1, addr2, addrs);
+    pwd_seed_key(aid, bid, id_len, ids);
     addr[0] = password;
     len[0] = password_len;
     addr[1] = &counter;
@@ -713,8 +719,9 @@ static int derive_pwe_ffc(
             break;
         }
         if (hmac_sha256_vector(
-                addrs,
-                sizeof(addrs), 2,
+                ids,
+                sizeof(ids),
+                2,
                 addr,
                 len,
                 pwd_seed) < 0)
@@ -870,9 +877,10 @@ static int derive_commit(df_data *df)
     return ret ? -1 : 0;
 }
 
-int dragonfly_prepare_commit(
-    const u8 *addr1,
-    const u8 *addr2,
+int dragonfly_commit(
+    const u8 *aid,
+    const u8 *bid,
+    const size_t id_len,
     const u8 *password,
     size_t password_len,
     df_data *df)
@@ -880,14 +888,16 @@ int dragonfly_prepare_commit(
     if (df->tmp == NULL ||
         (df->tmp->ec && derive_pwe_ecc(
                             df,
-                            addr1,
-                            addr2,
+                            aid,
+                            bid,
+                            id_len,
                             password,
                             password_len) < 0) ||
         (df->tmp->dh && derive_pwe_ffc(
                             df,
-                            addr1,
-                            addr2,
+                            aid,
+                            bid,
+                            id_len,
                             password,
                             password_len) < 0))
     {

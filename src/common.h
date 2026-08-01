@@ -32,10 +32,6 @@ static inline void PUT_LE16(u8 *a, u16 val)
     a[0] = (u8)(val & 0xff);
 }
 
-#ifndef ETH_ALEN
-#define ETH_ALEN 6
-#endif
-
 void forced_memzero(void *ptr, size_t len);
 
 void bin_clear_free(void *bin, size_t len);

@@ -53,7 +53,6 @@ typedef struct
     df_buf *anti_clogging_token;
     char *pw_id;
     int vlan_id;
-    u8 bssid[ETH_ALEN];
     df_buf *own_rejected_groups;
     df_buf *peer_rejected_groups;
     u32 own_addr_higher : 1;
@@ -89,9 +88,10 @@ typedef struct
 
 int dragonfly_group_allowed(df_data *df, int *allowed_groups, u16 group);
 
-int dragonfly_prepare_commit(
-    const u8 *addr1,
-    const u8 *addr2,
+int dragonfly_commit(
+    const u8 *aid,
+    const u8 *bid,
+    const size_t id_len,
     const u8 *password,
     size_t password_len,
     df_data *df);
