@@ -71,7 +71,6 @@ typedef enum
 typedef struct
 {
     df_state state;
-    u16 send_confirm;
     u8 pmk[DF_PMK_LEN_MAX];
     size_t pmk_len;
     int akmp;
@@ -99,12 +98,8 @@ int dragonfly_prepare_commit(
 
 int dragonfly_process_commit(df_data *df);
 
-int dragonfly_write_confirm(df_data *df, df_buf *buf);
+int dragonfly_confirm(df_data *df, df_buf *hash);
 
-int dragonfly_check_confirm(
-    df_data *df,
-    const u8 *data,
-    size_t len,
-    int *ie_offset);
+int dragonfly_check_confirm(df_data *df, const u8 *hash, size_t hash_len);
 
 #endif
