@@ -99,4 +99,12 @@ int dragonfly_prepare_commit(
 
 int dragonfly_process_commit(df_data *df);
 
+int dragonfly_write_confirm(df_data *df, df_buf *buf);
+
+int dragonfly_check_confirm(
+    df_data *df,
+    const u8 *data,
+    size_t len,
+    int *ie_offset);
+
 #endif

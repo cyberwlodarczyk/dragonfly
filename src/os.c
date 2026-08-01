@@ -10,6 +10,19 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "common.h"
+
+int os_memcmp_const(const void *a, const void *b, size_t len)
+{
+    const u8 *aa = a;
+    const u8 *bb = b;
+    u8 res = 0;
+    for (size_t i = 0; i < len; i++)
+    {
+        res |= aa[i] ^ bb[i];
+    }
+    return res;
+}
 
 void *os_zalloc(size_t size)
 {

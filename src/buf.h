@@ -73,6 +73,12 @@ static inline void df_buf_put_buf(df_buf *dst, const df_buf *src)
     df_buf_put_data(dst, df_buf_head(src), df_buf_len(src));
 }
 
+static inline void df_buf_put_le16(df_buf *buf, u16 data)
+{
+    u8 *pos = (u8 *)df_buf_put(buf, 2);
+    PUT_LE16(pos, data);
+}
+
 void df_buf_free(df_buf *buf);
 
 #endif

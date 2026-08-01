@@ -996,12 +996,12 @@ static size_t ecc_prime_len_2_hash_len(size_t prime_len)
     return 64;
 }
 
-#define WPA_KEY_MGMT_SAE_EXT_KEY BIT(26)
-#define WPA_KEY_MGMT_FT_SAE_EXT_KEY BIT(27)
+#define WPA_KEY_MGMT_DF_EXT_KEY BIT(26)
+#define WPA_KEY_MGMT_FT_DF_EXT_KEY BIT(27)
 
-static inline int wpa_key_mgmt_sae_ext_key(int akm)
+static inline int wpa_key_mgmt_DF_ext_key(int akm)
 {
-    return !!(akm & (int)(WPA_KEY_MGMT_SAE_EXT_KEY | WPA_KEY_MGMT_FT_SAE_EXT_KEY));
+    return !!(akm & (int)(WPA_KEY_MGMT_DF_EXT_KEY | WPA_KEY_MGMT_FT_DF_EXT_KEY));
 }
 
 static int hkdf_extract(
@@ -1080,7 +1080,7 @@ static int derive_keys(df_data *df, const u8 *k)
         hash_len = ecc_prime_len_2_hash_len(prime_len);
     }
     size_t pmk_len;
-    if (wpa_key_mgmt_sae_ext_key(df->akmp))
+    if (wpa_key_mgmt_DF_ext_key(df->akmp))
     {
         pmk_len = hash_len;
     }
@@ -1210,6 +1210,236 @@ int dragonfly_process_commit(df_data *df)
         derive_keys(df, k) < 0)
     {
         return -1;
+    }
+    return 0;
+}
+
+static int cn_confirm(
+    df_data *df,
+    const u8 *sc,
+    const crypto_bignum *scalar1,
+    const u8 *element1,
+    size_t element1_len,
+    const crypto_bignum *scalar2,
+    const u8 *element2,
+    size_t element2_len,
+    u8 *confirm)
+{
+    u8 scalar_b1[DF_MAX_PRIME_LEN], scalar_b2[DF_MAX_PRIME_LEN];
+    /* Confirm
+     * CN(key, X, Y, Z, ...) =
+     *    HMAC-SHA256(key, D2OS(X) || D2OS(Y) || D2OS(Z) | ...)
+     * confirm = CN(KCK, send-confirm, commit-scalar, COMMIT-ELEMENT,
+     *              peer-commit-scalar, PEER-COMMIT-ELEMENT)
+     * verifier = CN(KCK, peer-send-confirm, peer-commit-scalar,
+     *               PEER-COMMIT-ELEMENT, commit-scalar, COMMIT-ELEMENT)
+     */
+    if (crypto_bignum_to_bin(
+            scalar1,
+            scalar_b1,
+            sizeof(scalar_b1),
+            df->tmp->prime_len) < 0 ||
+        crypto_bignum_to_bin(
+            scalar2,
+            scalar_b2, sizeof(scalar_b2),
+            df->tmp->prime_len) < 0)
+    {
+        return -1;
+    }
+    const u8 *addr[5];
+    size_t len[5];
+    addr[0] = sc;
+    len[0] = 2;
+    addr[1] = scalar_b1;
+    len[1] = df->tmp->prime_len;
+    addr[2] = element1;
+    len[2] = element1_len;
+    addr[3] = scalar_b2;
+    len[3] = df->tmp->prime_len;
+    addr[4] = element2;
+    len[4] = element2_len;
+    return hkdf_extract(
+        df->tmp->kck_len,
+        df->tmp->kck,
+        df->tmp->kck_len,
+        5,
+        addr,
+        len,
+        confirm);
+}
+
+static int cn_confirm_ecc(
+    df_data *df,
+    const u8 *sc,
+    const crypto_bignum *scalar1,
+    const crypto_ec_point *element1,
+    const crypto_bignum *scalar2,
+    const crypto_ec_point *element2,
+    u8 *confirm)
+{
+    u8 element_b1[2 * DF_MAX_ECC_PRIME_LEN];
+    u8 element_b2[2 * DF_MAX_ECC_PRIME_LEN];
+    if (crypto_ec_point_to_bin(
+            df->tmp->ec,
+            element1,
+            element_b1,
+            element_b1 + df->tmp->prime_len) < 0 ||
+        crypto_ec_point_to_bin(
+            df->tmp->ec,
+            element2,
+            element_b2,
+            element_b2 + df->tmp->prime_len) < 0 ||
+        cn_confirm(
+            df,
+            sc,
+            scalar1,
+            element_b1,
+            2 * df->tmp->prime_len,
+            scalar2,
+            element_b2, 2 * df->tmp->prime_len,
+            confirm) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int cn_confirm_ffc(
+    df_data *df,
+    const u8 *sc,
+    const crypto_bignum *scalar1,
+    const crypto_bignum *element1,
+    const crypto_bignum *scalar2,
+    const crypto_bignum *element2,
+    u8 *confirm)
+{
+    u8 element_b1[DF_MAX_PRIME_LEN];
+    u8 element_b2[DF_MAX_PRIME_LEN];
+    if (crypto_bignum_to_bin(
+            element1,
+            element_b1,
+            sizeof(element_b1),
+            df->tmp->prime_len) < 0 ||
+        crypto_bignum_to_bin(
+            element2,
+            element_b2,
+            sizeof(element_b2),
+            df->tmp->prime_len) < 0 ||
+        cn_confirm(
+            df,
+            sc,
+            scalar1,
+            element_b1,
+            df->tmp->prime_len,
+            scalar2,
+            element_b2,
+            df->tmp->prime_len,
+            confirm) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+int dragonfly_write_confirm(df_data *df, df_buf *buf)
+{
+    if (df->tmp == NULL)
+    {
+        return -1;
+    }
+    /* Send-Confirm */
+    if (df->send_confirm < 0xffff)
+    {
+        df->send_confirm++;
+    }
+    const u8 *sc = df_buf_put(buf, 0);
+    df_buf_put_le16(buf, df->send_confirm);
+    int res;
+    size_t hash_len = df->tmp->kck_len;
+    if (df->tmp->ec != NULL)
+    {
+        res = cn_confirm_ecc(
+            df,
+            sc,
+            df->tmp->own_commit_scalar,
+            df->tmp->own_commit_element_ecc,
+            df->peer_commit_scalar,
+            df->tmp->peer_commit_element_ecc,
+            df_buf_put(buf, hash_len));
+    }
+    else
+    {
+        res = cn_confirm_ffc(
+            df,
+            sc,
+            df->tmp->own_commit_scalar,
+            df->tmp->own_commit_element_ffc,
+            df->peer_commit_scalar,
+            df->tmp->peer_commit_element_ffc,
+            df_buf_put(buf, hash_len));
+    }
+    return res;
+}
+
+int dragonfly_check_confirm(
+    df_data *df,
+    const u8 *data,
+    size_t len,
+    int *ie_offset)
+{
+    if (df->tmp == NULL)
+    {
+        return -1;
+    }
+    size_t hash_len = df->tmp->kck_len;
+    if (len < 2 + hash_len)
+    {
+        return -1;
+    }
+    if (!df->peer_commit_scalar || !df->tmp->own_commit_scalar)
+    {
+        return -1;
+    }
+    u8 verifier[DF_MAX_HASH_LEN];
+    if (df->tmp->ec)
+    {
+        if (!df->tmp->peer_commit_element_ecc ||
+            !df->tmp->own_commit_element_ecc ||
+            cn_confirm_ecc(
+                df, data,
+                df->peer_commit_scalar,
+                df->tmp->peer_commit_element_ecc,
+                df->tmp->own_commit_scalar,
+                df->tmp->own_commit_element_ecc,
+                verifier) < 0)
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        if (!df->tmp->peer_commit_element_ffc ||
+            !df->tmp->own_commit_element_ffc ||
+            cn_confirm_ffc(
+                df,
+                data,
+                df->peer_commit_scalar,
+                df->tmp->peer_commit_element_ffc,
+                df->tmp->own_commit_scalar,
+                df->tmp->own_commit_element_ffc,
+                verifier) < 0)
+        {
+            return -1;
+        }
+    }
+    if (os_memcmp_const(verifier, data + 2, hash_len) != 0)
+    {
+        return -1;
+    }
+    /* 2 bytes are for send-confirm, then the hash, followed by IEs */
+    if (ie_offset)
+    {
+        *ie_offset = 2 + (int)hash_len;
     }
     return 0;
 }

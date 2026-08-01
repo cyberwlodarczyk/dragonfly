@@ -30,6 +30,8 @@ typedef struct
 
 #define os_malloc(s) malloc((s))
 
+int os_memcmp_const(const void *a, const void *b, size_t len);
+
 void *os_zalloc(size_t size);
 
 void os_free(void *ptr);
