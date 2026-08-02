@@ -30,10 +30,6 @@ static void clear_temp_data(df_data *df)
     crypto_ec_point_deinit(tmp->pwe_ecc, 1);
     crypto_ec_point_deinit(tmp->own_commit_element_ecc, 0);
     crypto_ec_point_deinit(tmp->peer_commit_element_ecc, 0);
-    df_buf_free(tmp->anti_clogging_token);
-    df_buf_free(tmp->own_rejected_groups);
-    df_buf_free(tmp->peer_rejected_groups);
-    os_free(tmp->pw_id);
     bin_clear_free(tmp, sizeof(*tmp));
     df->tmp = NULL;
 }
@@ -46,11 +42,10 @@ static void clear_data(df_data *df)
     }
     clear_temp_data(df);
     crypto_bignum_deinit(df->peer_commit_scalar, 0);
-    crypto_bignum_deinit(df->peer_commit_scalar_accepted, 0);
     os_memset(df, 0, sizeof(*df));
 }
 
-static int set_group(df_data *df, int group)
+int dragonfly_set_group(df_data *df, int group)
 {
     clear_data(df);
     df_temporary_data *tmp = df->tmp = os_zalloc(sizeof(*tmp));
@@ -100,42 +95,6 @@ static int set_group(df_data *df, int group)
         return 0;
     }
     return -1;
-}
-
-int dragonfly_group_allowed(df_data *df, int *allowed_groups, u16 group)
-{
-    if (allowed_groups)
-    {
-        int i;
-        for (i = 0; allowed_groups[i] > 0; i++)
-        {
-            if (allowed_groups[i] == group)
-            {
-                break;
-            }
-        }
-        if (allowed_groups[i] != group)
-        {
-            return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
-        }
-    }
-    if (df->state == DF_COMMITTED && group != df->group)
-    {
-        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
-    }
-    if (group != df->group && set_group(df, group) < 0)
-    {
-        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
-    }
-    if (df->tmp == NULL)
-    {
-        return DF_ERR_FAIL;
-    }
-    if (df->tmp->dh && !allowed_groups)
-    {
-        return DF_ERR_FCC_GROUP_NOT_SUPPORTED;
-    }
-    return DF_OK;
 }
 
 static void pwd_seed_key(
@@ -883,7 +842,8 @@ int dragonfly_commit(
     const size_t id_len,
     const u8 *password,
     size_t password_len,
-    df_data *df)
+    df_data *df,
+    df_buf *buf)
 {
     if (df->tmp == NULL ||
         (df->tmp->ec && derive_pwe_ecc(
@@ -903,9 +863,44 @@ int dragonfly_commit(
     {
         return -1;
     }
-    df->h2e = 0;
-    df->pk = 0;
-    return derive_commit(df);
+    if (derive_commit(df) < 0)
+    {
+        return -1;
+    }
+    u8 *pos = df_buf_put(buf, df->tmp->prime_len);
+    if (crypto_bignum_to_bin(
+            df->tmp->own_commit_scalar,
+            pos,
+            df->tmp->prime_len,
+            df->tmp->prime_len) < 0)
+    {
+        return -1;
+    }
+    if (df->tmp->ec)
+    {
+        pos = df_buf_put(buf, 2 * df->tmp->prime_len);
+        if (crypto_ec_point_to_bin(
+                df->tmp->ec,
+                df->tmp->own_commit_element_ecc,
+                pos,
+                pos + df->tmp->prime_len) < 0)
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        pos = df_buf_put(buf, df->tmp->prime_len);
+        if (crypto_bignum_to_bin(
+                df->tmp->own_commit_element_ffc,
+                pos,
+                df->tmp->prime_len,
+                df->tmp->prime_len) < 0)
+        {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int derive_k_ecc(df_data *df, u8 *k)
@@ -980,40 +975,6 @@ fail:
     return ret;
 }
 
-static size_t ffc_prime_len_2_hash_len(size_t prime_len)
-{
-    if (prime_len <= 2048 / 8)
-    {
-        return 32;
-    }
-    if (prime_len <= 3072 / 8)
-    {
-        return 48;
-    }
-    return 64;
-}
-
-static size_t ecc_prime_len_2_hash_len(size_t prime_len)
-{
-    if (prime_len <= 256 / 8)
-    {
-        return 32;
-    }
-    if (prime_len <= 384 / 8)
-    {
-        return 48;
-    }
-    return 64;
-}
-
-#define WPA_KEY_MGMT_DF_EXT_KEY BIT(26)
-#define WPA_KEY_MGMT_FT_DF_EXT_KEY BIT(27)
-
-static inline int wpa_key_mgmt_DF_ext_key(int akm)
-{
-    return !!(akm & (int)(WPA_KEY_MGMT_DF_EXT_KEY | WPA_KEY_MGMT_FT_DF_EXT_KEY));
-}
-
 static int hkdf_extract(
     size_t hash_len,
     const u8 *salt,
@@ -1068,7 +1029,7 @@ static int derive_keys(df_data *df, const u8 *k)
     {
         goto fail;
     }
-    size_t hash_len, prime_len = df->tmp->prime_len;
+    size_t hash_len = SHA256_MAC_LEN, prime_len = df->tmp->prime_len;
     /* keyseed = H(salt, k)
      * KCK || PMK = KDF-Hash-Length(keyseed, "SAE KCK and PMK",
      *                      (commit-scalar + peer-commit-scalar) modulo r)
@@ -1077,81 +1038,12 @@ static int derive_keys(df_data *df, const u8 *k)
      * When SAE-PK is used,
      * KCK || PMK || KEK = KDF-Hash-Length(keyseed, "SAE-PK keys", context)
      */
-    if (!df->h2e)
-    {
-        hash_len = SHA256_MAC_LEN;
-    }
-    else if (df->tmp->dh)
-    {
-        hash_len = ffc_prime_len_2_hash_len(prime_len);
-    }
-    else
-    {
-        hash_len = ecc_prime_len_2_hash_len(prime_len);
-    }
-    size_t pmk_len;
-    if (wpa_key_mgmt_DF_ext_key(df->akmp))
-    {
-        pmk_len = hash_len;
-    }
-    else
-    {
-        pmk_len = DF_PMK_LEN;
-    }
     const u8 *salt;
     size_t salt_len;
     u8 zero[DF_MAX_HASH_LEN];
-    if (df->h2e &&
-        (df->tmp->own_rejected_groups || df->tmp->peer_rejected_groups))
-    {
-        df_buf *own, *peer;
-        own = df->tmp->own_rejected_groups;
-        peer = df->tmp->peer_rejected_groups;
-        salt_len = 0;
-        if (own)
-        {
-            salt_len += df_buf_len(own);
-        }
-        if (peer)
-        {
-            salt_len += df_buf_len(peer);
-        }
-        rejected_groups = df_buf_alloc(salt_len);
-        if (!rejected_groups)
-        {
-            goto fail;
-        }
-        if (df->tmp->own_addr_higher)
-        {
-            if (own)
-            {
-                df_buf_put_buf(rejected_groups, own);
-            }
-            if (peer)
-            {
-                df_buf_put_buf(rejected_groups, peer);
-            }
-        }
-        else
-        {
-            if (peer)
-            {
-                df_buf_put_buf(rejected_groups, peer);
-            }
-            if (own)
-            {
-                df_buf_put_buf(rejected_groups, own);
-            }
-        }
-        salt = df_buf_head(rejected_groups);
-        salt_len = df_buf_len(rejected_groups);
-    }
-    else
-    {
-        os_memset(zero, 0, hash_len);
-        salt = zero;
-        salt_len = hash_len;
-    }
+    os_memset(zero, 0, hash_len);
+    salt = zero;
+    salt_len = hash_len;
     const u8 *addr[1] = {k};
     size_t len[1] = {prime_len};
     u8 keyseed[DF_MAX_HASH_LEN];
@@ -1186,6 +1078,7 @@ static int derive_keys(df_data *df, const u8 *k)
         goto fail;
     }
     u8 keys[2 * DF_MAX_HASH_LEN + DF_PMK_LEN_MAX];
+    size_t pmk_len = DF_PMK_LEN;
     if (kdf_hash(
             hash_len,
             keyseed,
@@ -1211,8 +1104,194 @@ fail:
     return ret;
 }
 
-int dragonfly_process_commit(df_data *df)
+static u16 parse_commit_scalar(
+    df_data *df,
+    const u8 **pos,
+    const u8 *end)
 {
+    if ((long int)df->tmp->prime_len > end - *pos)
+    {
+        return 1;
+    }
+    crypto_bignum *peer_scalar = crypto_bignum_init_set(
+        *pos,
+        df->tmp->prime_len);
+    if (peer_scalar == NULL)
+    {
+        return 1;
+    }
+    /* 1 < scalar < r */
+    if (crypto_bignum_is_zero(peer_scalar) ||
+        crypto_bignum_is_one(peer_scalar) ||
+        crypto_bignum_cmp(peer_scalar, df->tmp->order) >= 0)
+    {
+        crypto_bignum_deinit(peer_scalar, 0);
+        return 1;
+    }
+    crypto_bignum_deinit(df->peer_commit_scalar, 0);
+    df->peer_commit_scalar = peer_scalar;
+    *pos += df->tmp->prime_len;
+    return 0;
+}
+
+static u16 parse_commit_element_ecc(
+    df_data *df,
+    const u8 **pos,
+    const u8 *end)
+{
+    u8 prime[DF_MAX_ECC_PRIME_LEN];
+    if ((long int)(2 * df->tmp->prime_len) > end - *pos)
+    {
+        return 1;
+    }
+    if (crypto_bignum_to_bin(
+            df->tmp->prime,
+            prime,
+            sizeof(prime),
+            df->tmp->prime_len) < 0)
+    {
+        return 1;
+    }
+    /* element x and y coordinates < p */
+    if (
+        os_memcmp(*pos, prime, df->tmp->prime_len) >= 0 ||
+        os_memcmp(*pos + df->tmp->prime_len, prime, df->tmp->prime_len) >= 0)
+    {
+        return 1;
+    }
+    crypto_ec_point_deinit(df->tmp->peer_commit_element_ecc, 0);
+    df->tmp->peer_commit_element_ecc =
+        crypto_ec_point_from_bin(df->tmp->ec, *pos);
+    if (!df->tmp->peer_commit_element_ecc)
+    {
+        return 1;
+    }
+    if (!crypto_ec_point_is_on_curve(
+            df->tmp->ec,
+            df->tmp->peer_commit_element_ecc))
+    {
+        return 1;
+    }
+    *pos += 2 * df->tmp->prime_len;
+    return 0;
+}
+
+static u16 parse_commit_element_ffc(
+    df_data *df,
+    const u8 **pos,
+    const u8 *end)
+{
+    if ((long int)df->tmp->prime_len > end - *pos)
+    {
+        return 1;
+    }
+    crypto_bignum_deinit(df->tmp->peer_commit_element_ffc, 0);
+    df->tmp->peer_commit_element_ffc =
+        crypto_bignum_init_set(*pos, df->tmp->prime_len);
+    if (df->tmp->peer_commit_element_ffc == NULL)
+    {
+        return 1;
+    }
+    /* 1 < element < p - 1 */
+    crypto_bignum *res = crypto_bignum_init();
+    const u8 one_bin[1] = {0x01};
+    crypto_bignum *one = crypto_bignum_init_set(one_bin, sizeof(one_bin));
+    if (!res ||
+        !one ||
+        crypto_bignum_sub(df->tmp->prime, one, res) ||
+        crypto_bignum_is_zero(df->tmp->peer_commit_element_ffc) ||
+        crypto_bignum_is_one(df->tmp->peer_commit_element_ffc) ||
+        crypto_bignum_cmp(df->tmp->peer_commit_element_ffc, res) >= 0)
+    {
+        crypto_bignum_deinit(res, 0);
+        crypto_bignum_deinit(one, 0);
+        return 1;
+    }
+    crypto_bignum_deinit(one, 0);
+    /* scalar-op(r, ELEMENT) = 1 modulo p */
+    if (crypto_bignum_exptmod(
+            df->tmp->peer_commit_element_ffc,
+            df->tmp->order,
+            df->tmp->prime,
+            res) < 0 ||
+        !crypto_bignum_is_one(res))
+    {
+        crypto_bignum_deinit(res, 0);
+        return 1;
+    }
+    crypto_bignum_deinit(res, 0);
+    *pos += df->tmp->prime_len;
+    return 0;
+}
+
+static u16 parse_commit_element(
+    df_data *df,
+    const u8 **pos,
+    const u8 *end)
+{
+    if (df->tmp->dh != NULL)
+    {
+        return parse_commit_element_ffc(df, pos, end);
+    }
+    return parse_commit_element_ecc(df, pos, end);
+}
+
+static u16 parse_commit(df_data *df, const u8 *data, size_t len)
+{
+    const u8 *pos = data, *end = data + len;
+    /* Check Finite Cyclic Group */
+    if (end - pos < 2)
+    {
+        return 1;
+    }
+    /* commit-scalar */
+    u16 res = parse_commit_scalar(df, &pos, end);
+    if (res != 0)
+    {
+        return res;
+    }
+    /* commit-element */
+    res = parse_commit_element(df, &pos, end);
+    if (res != 0)
+    {
+        return res;
+    }
+    /*
+     * Check whether peer-commit-scalar and PEER-COMMIT-ELEMENT are same as
+     * the values we sent which would be evidence of a reflection attack.
+     */
+    if (!df->tmp->own_commit_scalar ||
+        crypto_bignum_cmp(
+            df->tmp->own_commit_scalar,
+            df->peer_commit_scalar) != 0 ||
+        (df->tmp->dh &&
+         (!df->tmp->own_commit_element_ffc ||
+          crypto_bignum_cmp(
+              df->tmp->own_commit_element_ffc,
+              df->tmp->peer_commit_element_ffc) != 0)) ||
+        (df->tmp->ec &&
+         (!df->tmp->own_commit_element_ecc ||
+          crypto_ec_point_cmp(
+              df->tmp->ec,
+              df->tmp->own_commit_element_ecc,
+              df->tmp->peer_commit_element_ecc) != 0)))
+    {
+        return 0; /* scalars/elements are different */
+    }
+    /*
+     * This is a reflection attack - return special value to trigger caller
+     * to silently discard the frame instead of replying with a specific
+     * status code.
+     */
+    return 65535;
+}
+
+int dragonfly_process_commit(df_data *df, const u8 *buf, size_t len)
+{
+    if (parse_commit(df, buf, len) != 0)
+    {
+        return -1;
+    }
     u8 k[DF_MAX_PRIME_LEN];
     if (df->tmp == NULL ||
         (df->tmp->ec && derive_k_ecc(df, k) < 0) ||
@@ -1344,7 +1423,7 @@ static int cn_confirm_ffc(
     return 0;
 }
 
-int dragonfly_confirm(df_data *df, df_buf *hash)
+int dragonfly_confirm(df_data *df, df_buf *buf)
 {
     if (df->tmp == NULL)
     {
@@ -1359,7 +1438,7 @@ int dragonfly_confirm(df_data *df, df_buf *hash)
             df->tmp->own_commit_element_ecc,
             df->peer_commit_scalar,
             df->tmp->peer_commit_element_ecc,
-            df_buf_put(hash, df->tmp->kck_len));
+            df_buf_put(buf, df->tmp->kck_len));
     }
     else
     {
@@ -1369,18 +1448,18 @@ int dragonfly_confirm(df_data *df, df_buf *hash)
             df->tmp->own_commit_element_ffc,
             df->peer_commit_scalar,
             df->tmp->peer_commit_element_ffc,
-            df_buf_put(hash, df->tmp->kck_len));
+            df_buf_put(buf, df->tmp->kck_len));
     }
     return res;
 }
 
-int dragonfly_check_confirm(df_data *df, const u8 *hash, size_t hash_len)
+int dragonfly_check_confirm(df_data *df, const u8 *buf, size_t len)
 {
     if (df->tmp == NULL)
     {
         return -1;
     }
-    if (hash_len < 2 + df->tmp->kck_len)
+    if (len < 2 + df->tmp->kck_len)
     {
         return -1;
     }
@@ -1419,7 +1498,7 @@ int dragonfly_check_confirm(df_data *df, const u8 *hash, size_t hash_len)
             return -1;
         }
     }
-    if (os_memcmp_const(verifier, hash, hash_len) != 0)
+    if (os_memcmp_const(verifier, buf, len) != 0)
     {
         return -1;
     }

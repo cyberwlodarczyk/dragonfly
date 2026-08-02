@@ -140,6 +140,11 @@ int crypto_bignum_rshift(
     return BN_rshift(r, a, n) == 1 ? 0 : -1;
 }
 
+int crypto_bignum_cmp(const crypto_bignum *a, const crypto_bignum *b)
+{
+    return BN_cmp(a, b);
+}
+
 int crypto_bignum_add(
     const crypto_bignum *a,
     const crypto_bignum *b,
@@ -455,6 +460,19 @@ crypto_bignum *crypto_ec_point_compute_y_sqr(
 int crypto_ec_point_is_at_infinity(crypto_ec *e, const crypto_ec_point *p)
 {
     return EC_POINT_is_at_infinity(e->group, p);
+}
+
+int crypto_ec_point_is_on_curve(crypto_ec *e, const crypto_ec_point *p)
+{
+    return EC_POINT_is_on_curve(e->group, p, e->bnctx) == 1;
+}
+
+int crypto_ec_point_cmp(
+    const crypto_ec *e,
+    const crypto_ec_point *a,
+    const crypto_ec_point *b)
+{
+    return EC_POINT_cmp(e->group, a, b, e->bnctx);
 }
 
 crypto_ec_point *crypto_ec_point_from_bin(crypto_ec *e, const u8 *val)

@@ -50,6 +50,8 @@ int crypto_bignum_rshift(
     int n,
     crypto_bignum *r);
 
+int crypto_bignum_cmp(const crypto_bignum *a, const crypto_bignum *b);
+
 int crypto_bignum_add(const crypto_bignum *a,
                       const crypto_bignum *b,
                       crypto_bignum *c);
@@ -143,6 +145,13 @@ crypto_bignum *crypto_ec_point_compute_y_sqr(
     const crypto_bignum *x);
 
 int crypto_ec_point_is_at_infinity(crypto_ec *e, const crypto_ec_point *p);
+
+int crypto_ec_point_is_on_curve(crypto_ec *e, const crypto_ec_point *p);
+
+int crypto_ec_point_cmp(
+    const crypto_ec *e,
+    const crypto_ec_point *a,
+    const crypto_ec_point *b);
 
 crypto_ec_point *crypto_ec_point_from_bin(crypto_ec *e, const u8 *val);
 

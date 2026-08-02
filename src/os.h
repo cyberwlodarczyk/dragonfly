@@ -12,14 +12,6 @@
 #include <stddef.h>
 #include <string.h>
 
-typedef long os_time_t;
-
-typedef struct
-{
-    os_time_t sec;
-    os_time_t usec;
-} os_reltime;
-
 #define os_strlen(s) strlen(s)
 
 #define os_memcpy(dst, src, n) memcpy((dst), (src), (n))
