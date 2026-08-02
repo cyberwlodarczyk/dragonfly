@@ -1459,7 +1459,7 @@ int dragonfly_check_confirm(df_data *df, const u8 *buf, size_t len)
     {
         return -1;
     }
-    if (len < 2 + df->tmp->kck_len)
+    if (len < df->tmp->kck_len)
     {
         return -1;
     }
