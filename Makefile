@@ -25,6 +25,7 @@ SRC_DIR=src
 BUILD_DIR=build
 BIN_DIR=bin
 BIN_TEST=$(BIN_DIR)/test
+BIN_PERF=$(BIN_DIR)/perf
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	mkdir -p $(@D)
@@ -34,10 +35,13 @@ $(BIN_DIR)/%: %.c shared.c $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(wildcard
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) -I. $^ -o $@ -lcrypto
 
-build: $(BIN_TEST)
+build: $(BIN_TEST) $(BIN_PERF)
 
 test: $(BIN_TEST)
 	./$(BIN_TEST)
+
+perf: $(BIN_PERF)
+	./$(BIN_PERF)
 
 clean:
 	rm -rf $(BUILD_DIR)
