@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <openssl/opensslv.h>
 #include "shared.h"
 
-#define RUNS 1000
+#define RUNS 10000
 
 static int exchange_test(int group, const u8 *pwd_a, const u8 *pwd_b)
 {
@@ -92,7 +93,7 @@ static int test_run(const char *name, int f())
     }
     if (fail == 0)
     {
-        printf("ok (%d/%d)\n", RUNS, RUNS);
+        printf("ok\n");
         return 0;
     }
     else
@@ -104,6 +105,8 @@ static int test_run(const char *name, int f())
 
 int main()
 {
+    printf("%s\n", OPENSSL_VERSION_TEXT);
+    printf("N = %d\n", RUNS);
     int ok = 1;
     ok = test_run("p_256_correct", test_19_correct) == 0 && ok;
     ok = test_run("p_256_incorrect", test_19_incorrect) == 0 && ok;

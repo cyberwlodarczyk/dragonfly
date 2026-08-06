@@ -2,8 +2,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <openssl/opensslv.h>
 #include "shared.h"
 
+#define WARMUP_RUNS 100
 #define RUNS 10000
 
 static uint64_t time_ns()
@@ -222,7 +224,7 @@ static void perf_run(const char *name, uint64_t f())
     printf("%s: ", name);
     fflush(stdout);
     uint64_t total = 0;
-    for (int i = 0; i < RUNS; i++)
+    for (int i = 0; i < WARMUP_RUNS + RUNS; i++)
     {
         uint64_t ns = f();
         if (ns == 0)
@@ -230,7 +232,10 @@ static void perf_run(const char *name, uint64_t f())
             printf("fail\n");
             return;
         }
-        total += ns;
+        if (i >= WARMUP_RUNS)
+        {
+            total += ns;
+        }
     }
     uint64_t avg = total / RUNS;
     printf("%.2fµs\n", (double)avg / 1000);
@@ -238,10 +243,13 @@ static void perf_run(const char *name, uint64_t f())
 
 int main()
 {
-    perf_run("p_258_commit", perf_19_commit);
-    perf_run("p_258_process_commit", perf_19_process_commit);
-    perf_run("p_258_confirm", perf_19_confirm);
-    perf_run("p_258_check_confirm", perf_19_check_confirm);
+    printf("%s\n", OPENSSL_VERSION_TEXT);
+    printf("N warmup = %d\n", WARMUP_RUNS);
+    printf("N        = %d\n", RUNS);
+    perf_run("p_256_commit", perf_19_commit);
+    perf_run("p_256_process_commit", perf_19_process_commit);
+    perf_run("p_256_confirm", perf_19_confirm);
+    perf_run("p_256_check_confirm", perf_19_check_confirm);
     perf_run("p_384_commit", perf_20_commit);
     perf_run("p_384_process_commit", perf_20_process_commit);
     perf_run("p_384_confirm", perf_20_confirm);
